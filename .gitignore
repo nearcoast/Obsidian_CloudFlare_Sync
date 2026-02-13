@@ -1,0 +1,20 @@
+# Build output
+main.js
+
+# Dependencies
+node_modules/
+
+# Obsidian plugin data
+data.json
+
+# OS files
+.DS_Store
+
+# npm debug logs
+npm-debug.log*
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Environment / secrets
+.env
