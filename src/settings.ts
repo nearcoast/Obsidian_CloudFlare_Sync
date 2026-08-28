@@ -1,13 +1,18 @@
-import { App, Platform, PluginSettingTab, Setting } from "obsidian";
+import { App, Platform, PluginSettingTab, SecretComponent, Setting } from "obsidian";
 import type RemoteSyncPlugin from "./main";
 import { R2Client } from "./r2/r2-client";
+import { persistAndRestartR2Client } from "./r2/r2-settings-lifecycle";
+import { formatSafeR2Error, sanitizeR2Error } from "./r2/safe-error";
 
 export interface RemoteSyncSettings {
 	// R2
 	r2Enabled: boolean;
 	r2AccountId: string;
-	r2AccessKeyId: string;
-	r2SecretAccessKey: string;
+	r2AccessKeyIdSecretName: string;
+	r2SecretAccessKeySecretName: string;
+	// Legacy plaintext fields are accepted only long enough to migrate them.
+	r2AccessKeyId?: string;
+	r2SecretAccessKey?: string;
 	r2BucketName: string;
 	r2Jurisdiction: "" | "eu" | "fedramp";
 	syncIntervalSeconds: number;
@@ -25,8 +30,8 @@ export interface RemoteSyncSettings {
 export const DEFAULT_SETTINGS: RemoteSyncSettings = {
 	r2Enabled: false,
 	r2AccountId: "",
-	r2AccessKeyId: "",
-	r2SecretAccessKey: "",
+	r2AccessKeyIdSecretName: "",
+	r2SecretAccessKeySecretName: "",
 	r2BucketName: "",
 	r2Jurisdiction: "",
 	syncIntervalSeconds: 30,
@@ -64,8 +69,7 @@ export class RemoteSyncSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.r2Enabled)
 					.onChange(async (value) => {
 						this.plugin.settings.r2Enabled = value;
-						await this.plugin.saveSettings();
-						this.plugin.restartSyncEngine();
+						await persistAndRestartR2Client(this.plugin);
 					})
 			);
 
@@ -78,36 +82,33 @@ export class RemoteSyncSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.r2AccountId)
 					.onChange(async (value) => {
 						this.plugin.settings.r2AccountId = value.trim();
-						await this.plugin.saveSettings();
+						await persistAndRestartR2Client(this.plugin);
 					})
 			);
 
 		new Setting(containerEl)
 			.setName("Access Key ID")
-			.setDesc("R2 API token access key ID.")
-			.addText((text) =>
-				text
-					.setPlaceholder("Access Key ID")
-					.setValue(this.plugin.settings.r2AccessKeyId)
+			.setDesc("Select or create an Obsidian secret containing the R2 access key ID.")
+			.addComponent((el) =>
+				new SecretComponent(this.app, el)
+					.setValue(this.plugin.settings.r2AccessKeyIdSecretName)
 					.onChange(async (value) => {
-						this.plugin.settings.r2AccessKeyId = value.trim();
-						await this.plugin.saveSettings();
+						this.plugin.settings.r2AccessKeyIdSecretName = value;
+						await persistAndRestartR2Client(this.plugin);
 					})
 			);
 
 		new Setting(containerEl)
 			.setName("Secret Access Key")
-			.setDesc("R2 API token secret access key.")
-			.addText((text) => {
-				text.inputEl.type = "password";
-				text
-					.setPlaceholder("Secret Access Key")
-					.setValue(this.plugin.settings.r2SecretAccessKey)
+			.setDesc("Select or create an Obsidian secret containing the R2 secret access key.")
+			.addComponent((el) =>
+				new SecretComponent(this.app, el)
+					.setValue(this.plugin.settings.r2SecretAccessKeySecretName)
 					.onChange(async (value) => {
-						this.plugin.settings.r2SecretAccessKey = value.trim();
-						await this.plugin.saveSettings();
-					});
-			});
+						this.plugin.settings.r2SecretAccessKeySecretName = value;
+						await persistAndRestartR2Client(this.plugin);
+					})
+			);
 
 		new Setting(containerEl)
 			.setName("Bucket Name")
@@ -118,7 +119,7 @@ export class RemoteSyncSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.r2BucketName)
 					.onChange(async (value) => {
 						this.plugin.settings.r2BucketName = value.trim();
-						await this.plugin.saveSettings();
+						await persistAndRestartR2Client(this.plugin);
 					})
 			);
 
@@ -133,7 +134,7 @@ export class RemoteSyncSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.r2Jurisdiction)
 					.onChange(async (value) => {
 						this.plugin.settings.r2Jurisdiction = value as "" | "eu" | "fedramp";
-						await this.plugin.saveSettings();
+						await persistAndRestartR2Client(this.plugin);
 						this.display();
 					})
 			);
@@ -165,7 +166,13 @@ export class RemoteSyncSettingTab extends PluginSettingTab {
 						);
 
 						try {
-							const client = new R2Client(this.plugin.settings);
+							const credentials = this.plugin.getR2Credentials();
+							if (!credentials) {
+								resultEl.addClass("error");
+								resultEl.setText("Select two distinct R2 secrets first.");
+								return;
+							}
+							const client = new R2Client(this.plugin.settings, credentials);
 							const ok = await client.testConnection();
 							if (ok) {
 								resultEl.addClass("success");
@@ -179,10 +186,9 @@ export class RemoteSyncSettingTab extends PluginSettingTab {
 								);
 							}
 						} catch (e) {
+							const safeError = sanitizeR2Error(e);
 							resultEl.addClass("error");
-							resultEl.setText(
-								`Error: ${e instanceof Error ? e.message : String(e)}`
-							);
+							resultEl.setText(`Connection error — ${formatSafeR2Error(safeError)}`);
 						} finally {
 							button.setButtonText("Test Connection");
 							button.setDisabled(false);
@@ -204,7 +210,7 @@ export class RemoteSyncSettingTab extends PluginSettingTab {
 						const num = parseInt(value, 10);
 						if (!isNaN(num) && num >= 5) {
 							this.plugin.settings.syncIntervalSeconds = num;
-							await this.plugin.saveSettings();
+							await persistAndRestartR2Client(this.plugin);
 						}
 					})
 			);

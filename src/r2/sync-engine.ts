@@ -1,8 +1,9 @@
 import { Notice, Vault, TFile, TAbstractFile } from "obsidian";
 import type RemoteSyncPlugin from "../main";
-import type { RemoteSyncSettings } from "../settings";
+import type { R2Credentials } from "../credentials";
 import { R2Client, type R2Object } from "./r2-client";
 import { showConflictModal, type ConflictResolution } from "./conflict-modal";
+import { formatSafeR2Error, sanitizeR2Error } from "./safe-error";
 
 export interface FileSyncRecord {
 	localHash: string;
@@ -44,12 +45,13 @@ export class SyncEngine {
 
 	async start(): Promise<void> {
 		if (!this.plugin.settings.r2Enabled) return;
-		if (!this.hasValidConfig()) {
+		const credentials = this.plugin.getR2Credentials();
+		if (!this.hasValidConfig(credentials)) {
 			console.warn("Remote Sync: R2 credentials not configured.");
 			return;
 		}
 
-		this.client = new R2Client(this.plugin.settings);
+		this.client = new R2Client(this.plugin.settings, credentials);
 		await this.loadSyncState();
 		this.registerVaultEvents();
 		this.startTimer();
@@ -99,9 +101,9 @@ export class SyncEngine {
 		await this.runSyncCycle();
 	}
 
-	private hasValidConfig(): boolean {
+	private hasValidConfig(credentials: R2Credentials | null): credentials is R2Credentials {
 		const s = this.plugin.settings;
-		return !!(s.r2AccountId && s.r2AccessKeyId && s.r2SecretAccessKey && s.r2BucketName);
+		return !!(s.r2AccountId && credentials?.accessKeyId && credentials.secretAccessKey && s.r2BucketName);
 	}
 
 	private registerVaultEvents(): void {
@@ -250,9 +252,10 @@ export class SyncEngine {
 
 			this._status = "idle";
 		} catch (e) {
-			console.error("Remote Sync: sync cycle failed", e);
+			const safeError = sanitizeR2Error(e);
+			console.error("Remote Sync: sync cycle failed", safeError);
 			this._status = "error";
-			new Notice(`Remote Sync: sync error — ${e instanceof Error ? e.message : String(e)}`);
+			new Notice(`Remote Sync: sync error — ${formatSafeR2Error(safeError)}`);
 		} finally {
 			this.syncing = false;
 			this.plugin.updateStatusBar();

@@ -2,7 +2,7 @@
 	"id": "remote-sync",
 	"name": "Remote Sync",
 	"version": "0.1.0",
-	"minAppVersion": "1.0.0",
+	"minAppVersion": "1.11.4",
 	"description": "Sync your vault with Cloudflare R2 (near-real-time) and Git (on-demand snapshots).",
 	"author": "Peter",
 	"isDesktopOnly": false

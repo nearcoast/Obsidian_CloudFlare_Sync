@@ -6,6 +6,11 @@ import {
 } from "./settings";
 import { SyncEngine, type SyncStatus } from "./r2/sync-engine";
 import { GitSync } from "./git/git-sync";
+import {
+	migrateLegacyR2Credentials,
+	resolveR2Credentials,
+	type R2Credentials,
+} from "./credentials";
 
 export default class RemoteSyncPlugin extends Plugin {
 	settings: RemoteSyncSettings = DEFAULT_SETTINGS;
@@ -101,14 +106,24 @@ export default class RemoteSyncPlugin extends Plugin {
 	}
 
 	async loadSettings(): Promise<void> {
-		const data = await this.loadData();
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, data?.settings);
+		const data = (await this.loadData()) ?? {};
+		const loaded = Object.assign({}, DEFAULT_SETTINGS, data.settings) as RemoteSyncSettings;
+		const migration = migrateLegacyR2Credentials(loaded, this.app.secretStorage);
+		this.settings = migration.settings;
+		if (migration.migrated) {
+			data.settings = this.settings;
+			await this.saveData(data);
+		}
 	}
 
 	async saveSettings(): Promise<void> {
 		const data = (await this.loadData()) ?? {};
 		data.settings = this.settings;
 		await this.saveData(data);
+	}
+
+	getR2Credentials(): R2Credentials | null {
+		return resolveR2Credentials(this.settings, this.app.secretStorage);
 	}
 
 	async restartSyncEngine(): Promise<void> {

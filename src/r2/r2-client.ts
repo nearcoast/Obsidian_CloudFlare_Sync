@@ -6,6 +6,11 @@ import {
 	DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 import type { RemoteSyncSettings } from "../settings";
+import type { R2Credentials } from "../credentials";
+import { ObsidianHttpHandler } from "./obsidian-http-handler";
+import { copyUint8ArrayToArrayBuffer } from "./bytes";
+import { buildR2Endpoint } from "./r2-config";
+import { sanitizeR2Error } from "./safe-error";
 
 export interface R2Object {
 	key: string;
@@ -18,17 +23,17 @@ export class R2Client {
 	private client: S3Client;
 	private bucket: string;
 
-	constructor(settings: RemoteSyncSettings) {
+	constructor(settings: RemoteSyncSettings, credentials: R2Credentials) {
 		this.bucket = settings.r2BucketName;
-		const jur = settings.r2Jurisdiction;
-		const jurPart = jur ? `.${jur}` : "";
+		const endpoint = buildR2Endpoint(settings.r2AccountId, settings.r2Jurisdiction);
 		this.client = new S3Client({
-			endpoint: `https://${settings.r2AccountId}${jurPart}.r2.cloudflarestorage.com`,
+			endpoint,
 			region: "auto",
 			credentials: {
-				accessKeyId: settings.r2AccessKeyId,
-				secretAccessKey: settings.r2SecretAccessKey,
+				accessKeyId: credentials.accessKeyId,
+				secretAccessKey: credentials.secretAccessKey,
 			},
+			requestHandler: new ObsidianHttpHandler(),
 		});
 	}
 
@@ -58,7 +63,8 @@ export class R2Client {
 				})
 			);
 			return true;
-		} catch {
+		} catch (e) {
+			console.error("Remote Sync: testConnection failed", sanitizeR2Error(e));
 			return false;
 		}
 	}
@@ -125,7 +131,8 @@ export class R2Client {
 			throw new Error(`Empty response body for key: ${key}`);
 		}
 
-		return await response.Body.transformToByteArray();
+		const bytes = await response.Body.transformToByteArray();
+		return copyUint8ArrayToArrayBuffer(bytes);
 	}
 
 	async deleteObject(key: string): Promise<void> {
