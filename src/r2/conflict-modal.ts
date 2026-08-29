@@ -1,6 +1,10 @@
 import { App, Modal } from "obsidian";
+import {
+	createConflictDecision,
+	type ConflictResolution,
+} from "./conflict-decision";
 
-export type ConflictResolution = "keep-local" | "keep-remote" | "keep-both";
+export type { ConflictResolution } from "./conflict-decision";
 
 export interface ConflictInfo {
 	filePath: string;
@@ -11,17 +15,17 @@ export interface ConflictInfo {
 }
 
 export class ConflictModal extends Modal {
-	private resolve: (value: ConflictResolution) => void;
+	private choose: (value: ConflictResolution) => void;
 	private info: ConflictInfo;
 
 	constructor(
 		app: App,
 		info: ConflictInfo,
-		resolve: (value: ConflictResolution) => void
+		choose: (value: ConflictResolution) => void
 	) {
 		super(app);
 		this.info = info;
-		this.resolve = resolve;
+		this.choose = choose;
 	}
 
 	onOpen() {
@@ -73,7 +77,7 @@ export class ConflictModal extends Modal {
 			text: "Keep Local",
 		});
 		keepLocalBtn.addEventListener("click", () => {
-			this.resolve("keep-local");
+			this.choose("keep-local");
 			this.close();
 		});
 
@@ -81,7 +85,7 @@ export class ConflictModal extends Modal {
 			text: "Keep Remote",
 		});
 		keepRemoteBtn.addEventListener("click", () => {
-			this.resolve("keep-remote");
+			this.choose("keep-remote");
 			this.close();
 		});
 
@@ -90,12 +94,13 @@ export class ConflictModal extends Modal {
 			cls: "mod-cta",
 		});
 		keepBothBtn.addEventListener("click", () => {
-			this.resolve("keep-both");
+			this.choose("keep-both");
 			this.close();
 		});
 	}
 
 	onClose() {
+		this.choose("cancel");
 		this.contentEl.empty();
 	}
 }
@@ -104,9 +109,9 @@ export function showConflictModal(
 	app: App,
 	info: ConflictInfo
 ): Promise<ConflictResolution> {
-	return new Promise((resolve) => {
-		new ConflictModal(app, info, resolve).open();
-	});
+	const decision = createConflictDecision();
+	new ConflictModal(app, info, decision.choose).open();
+	return decision.promise;
 }
 
 function formatBytes(bytes: number): string {

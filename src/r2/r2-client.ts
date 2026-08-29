@@ -11,6 +11,12 @@ import { ObsidianHttpHandler } from "./obsidian-http-handler";
 import { copyUint8ArrayToArrayBuffer } from "./bytes";
 import { buildR2Endpoint } from "./r2-config";
 import { sanitizeR2Error } from "./safe-error";
+import {
+	buildExclusiveProbePutInput,
+	createProbeKey,
+	runConnectionProbe,
+} from "./connection-probe";
+import { remoteWriteCondition } from "./write-condition";
 
 export interface R2Object {
 	key: string;
@@ -38,30 +44,21 @@ export class R2Client {
 	}
 
 	async testConnection(): Promise<boolean> {
-		const testKey = ".remote-sync-test";
+		const testKey = createProbeKey(globalThis.crypto.randomUUID());
 		try {
-			// Write
-			await this.client.send(
-				new PutObjectCommand({
-					Bucket: this.bucket,
-					Key: testKey,
-					Body: new Uint8Array([116, 101, 115, 116]), // "test"
-				})
-			);
-			// Read
-			await this.client.send(
-				new GetObjectCommand({
-					Bucket: this.bucket,
-					Key: testKey,
-				})
-			);
-			// Delete
-			await this.client.send(
-				new DeleteObjectCommand({
-					Bucket: this.bucket,
-					Key: testKey,
-				})
-			);
+			await runConnectionProbe(testKey, {
+				createExclusive: async (key) => {
+					await this.client.send(
+						new PutObjectCommand(buildExclusiveProbePutInput(this.bucket, key))
+					);
+				},
+				read: async (key) => {
+					await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }));
+				},
+				remove: async (key) => {
+					await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key }));
+				},
+			});
 			return true;
 		} catch (e) {
 			console.error("Remote Sync: testConnection failed", sanitizeR2Error(e));
@@ -106,6 +103,7 @@ export class R2Client {
 	async uploadObject(
 		key: string,
 		body: ArrayBuffer,
+		listedEtag: string | null = null,
 		metadata?: Record<string, string>
 	): Promise<string> {
 		const response = await this.client.send(
@@ -114,6 +112,7 @@ export class R2Client {
 				Key: key,
 				Body: new Uint8Array(body),
 				Metadata: metadata,
+				...remoteWriteCondition(listedEtag),
 			})
 		);
 		return (response.ETag ?? "").replace(/"/g, "");
@@ -135,11 +134,12 @@ export class R2Client {
 		return copyUint8ArrayToArrayBuffer(bytes);
 	}
 
-	async deleteObject(key: string): Promise<void> {
+	async deleteObject(key: string, listedEtag: string | null = null): Promise<void> {
 		await this.client.send(
 			new DeleteObjectCommand({
 				Bucket: this.bucket,
 				Key: key,
+				...(listedEtag !== null ? { IfMatch: listedEtag } : {}),
 			})
 		);
 	}

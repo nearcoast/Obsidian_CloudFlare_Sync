@@ -4,6 +4,18 @@ import type { R2Credentials } from "../credentials";
 import { R2Client, type R2Object } from "./r2-client";
 import { showConflictModal, type ConflictResolution } from "./conflict-modal";
 import { formatSafeR2Error, sanitizeR2Error } from "./safe-error";
+import {
+	markPathChanged,
+	markPathDeleted,
+	restoreFailedSnapshot,
+	addMissingTrackedPathsAsDeleted,
+} from "./change-queue";
+import { arrayBuffersEqual } from "./content";
+import { isSafeVaultPath } from "./vault-path";
+import { decideReconciliation } from "./reconcile-plan";
+import { scheduleRemotePoll } from "./polling";
+import { REMOTE_SYNC_INTERNAL_PREFIX } from "./connection-probe";
+import { isPreconditionFailure } from "./precondition-failure";
 
 export interface FileSyncRecord {
 	localHash: string;
@@ -29,6 +41,7 @@ export class SyncEngine {
 	private syncing = false;
 	private eventRefs: ReturnType<Vault["on"]>[] = [];
 	private onSyncComplete: (() => void) | null = null;
+	private generation = 0;
 
 	get status(): SyncStatus {
 		return this._status;
@@ -52,19 +65,14 @@ export class SyncEngine {
 		}
 
 		this.client = new R2Client(this.plugin.settings, credentials);
+		this.generation += 1;
 		await this.loadSyncState();
 		this.registerVaultEvents();
 		this.startTimer();
 		this._status = "idle";
 		this.plugin.updateStatusBar();
 
-		// Initial sync: queue all local files so existing vault content gets synced
-		const files = this.vault.getFiles();
-		for (const file of files) {
-			if (!this.isExcluded(file.path)) {
-				this.changeQueue.add(file.path);
-			}
-		}
+		// Initial reconciliation derives changes from persisted state and both sides.
 		await this.runSyncCycle();
 	}
 
@@ -72,6 +80,7 @@ export class SyncEngine {
 		this.stopTimer();
 		this.unregisterVaultEvents();
 		this.client = null;
+		this.generation += 1;
 		this._status = "idle";
 		this.plugin.updateStatusBar();
 	}
@@ -91,13 +100,7 @@ export class SyncEngine {
 	}
 
 	async forceSync(): Promise<void> {
-		// Mark all local files as changed to trigger a full sync
-		const files = this.vault.getFiles();
-		for (const file of files) {
-			if (!this.isExcluded(file.path)) {
-				this.changeQueue.add(file.path);
-			}
-		}
+		// A full reconciliation already evaluates every local, remote, and tracked path.
 		await this.runSyncCycle();
 	}
 
@@ -124,25 +127,23 @@ export class SyncEngine {
 
 	private onFileChange(file: TAbstractFile): void {
 		if (file instanceof TFile && !this.isExcluded(file.path)) {
-			this.changeQueue.add(file.path);
+			markPathChanged(this.changeQueue, this.deletedPaths, file.path);
 		}
 	}
 
 	private onFileDelete(file: TAbstractFile): void {
 		if (file instanceof TFile && !this.isExcluded(file.path)) {
-			this.deletedPaths.add(file.path);
-			this.changeQueue.delete(file.path);
+			markPathDeleted(this.changeQueue, this.deletedPaths, file.path);
 		}
 	}
 
 	private onFileRename(file: TAbstractFile, oldPath: string): void {
 		if (file instanceof TFile) {
 			if (!this.isExcluded(oldPath)) {
-				this.deletedPaths.add(oldPath);
-				this.changeQueue.delete(oldPath);
+				markPathDeleted(this.changeQueue, this.deletedPaths, oldPath);
 			}
 			if (!this.isExcluded(file.path)) {
-				this.changeQueue.add(file.path);
+				markPathChanged(this.changeQueue, this.deletedPaths, file.path);
 			}
 		}
 	}
@@ -150,11 +151,9 @@ export class SyncEngine {
 	private startTimer(): void {
 		this.stopTimer();
 		const ms = this.plugin.settings.syncIntervalSeconds * 1000;
-		this.timer = setInterval(() => {
-			if (this.changeQueue.size > 0 || this.deletedPaths.size > 0) {
-				this.runSyncCycle();
-			}
-		}, ms);
+		this.timer = scheduleRemotePoll(setInterval, ms, () => {
+			void this.runSyncCycle();
+		});
 	}
 
 	private stopTimer(): void {
@@ -165,6 +164,9 @@ export class SyncEngine {
 	}
 
 	private isExcluded(filePath: string): boolean {
+		if (!isSafeVaultPath(filePath) || filePath.startsWith(REMOTE_SYNC_INTERNAL_PREFIX)) {
+			return true;
+		}
 		const settings = this.plugin.settings;
 
 		const excludedFolders = settings.excludedFolders
@@ -197,14 +199,16 @@ export class SyncEngine {
 		if (this.syncing || !this.client) return;
 		if (this._status === "paused") return;
 
+		const cycleGeneration = this.generation;
 		this.syncing = true;
 		this._status = "syncing";
 		this.plugin.updateStatusBar();
 
+		const changedPaths = new Set(this.changeQueue);
+		const deleted = new Set(this.deletedPaths);
+
 		try {
-			// Snapshot the queues and clear them
-			const changedPaths = new Set(this.changeQueue);
-			const deleted = new Set(this.deletedPaths);
+			// Clear only after snapshotting so failures can restore pending work.
 			this.changeQueue.clear();
 			this.deletedPaths.clear();
 
@@ -215,16 +219,24 @@ export class SyncEngine {
 			for (const obj of remoteObjects) {
 				remoteMap.set(obj.key, obj);
 			}
+			addMissingTrackedPathsAsDeleted(
+				deleted,
+				Object.keys(this.syncState.files),
+				new Set(localFiles.keys()),
+				(path) => this.isExcluded(path)
+			);
 
 			const allPaths = new Set<string>();
 			for (const path of localFiles.keys()) allPaths.add(path);
 			for (const key of remoteMap.keys()) allPaths.add(key);
+			for (const path of Object.keys(this.syncState.files)) allPaths.add(path);
 			for (const path of deleted) allPaths.add(path);
 
 			const isInitialSync = Object.keys(this.syncState.files).length === 0;
 
 			for (const path of allPaths) {
 				if (this.isExcluded(path)) continue;
+				if (this.generation !== cycleGeneration || !this.client) break;
 
 				const localFile = localFiles.get(path);
 				const remoteObj = remoteMap.get(path);
@@ -252,6 +264,13 @@ export class SyncEngine {
 
 			this._status = "idle";
 		} catch (e) {
+			if (isPreconditionFailure(e)) {
+				// Remote changed after listing; requeue and reconcile on the next cycle.
+				restoreFailedSnapshot(this.changeQueue, this.deletedPaths, changedPaths, deleted);
+				this._status = "idle";
+				return;
+			}
+			restoreFailedSnapshot(this.changeQueue, this.deletedPaths, changedPaths, deleted);
 			const safeError = sanitizeR2Error(e);
 			console.error("Remote Sync: sync cycle failed", safeError);
 			this._status = "error";
@@ -275,115 +294,95 @@ export class SyncEngine {
 
 		const localExists = localFile !== null && !wasDeleted;
 		const remoteExists = remoteObj !== null;
+		let localHash = syncRecord && localExists ? await this.hashFile(localFile!) : null;
+		const localChanged = !!syncRecord && localExists && localHash !== syncRecord.localHash;
+		const remoteChanged = !!syncRecord && remoteExists && remoteObj!.etag !== syncRecord.remoteETag;
+		let contentsEqual: boolean | undefined;
 
-		// Case: file exists nowhere (deleted on both sides or stale state)
-		if (!localExists && !remoteExists) {
-			delete this.syncState.files[path];
-			return;
+		if (
+			localExists &&
+			remoteExists &&
+			(!syncRecord || (localChanged && remoteChanged))
+		) {
+			const localContent = await this.vault.readBinary(localFile!);
+			const remoteContent = await this.client.downloadObject(path);
+			localHash = computeContentHash(localContent);
+			contentsEqual = arrayBuffersEqual(localContent, remoteContent);
 		}
 
-		// No previous sync record (new to sync system)
-		if (!syncRecord) {
-			if (localExists && !remoteExists) {
-				// New local file → upload
-				await this.uploadFile(path, localFile!);
+		const action = decideReconciliation({
+			hasRecord: syncRecord !== null,
+			localExists,
+			remoteExists,
+			wasDeleted,
+			wasChanged,
+			localChanged,
+			remoteChanged,
+			isInitialSync,
+			contentsEqual,
+		});
+
+		switch (action) {
+			case "clear-state":
+				delete this.syncState.files[path];
 				return;
-			}
-			if (!localExists && remoteExists) {
-				// New remote file → download
+			case "upload":
+				await this.uploadFile(path, localFile!, remoteObj ?? null);
+				return;
+			case "download":
 				await this.downloadFile(path, remoteObj!);
 				return;
-			}
-			if (localExists && remoteExists) {
-				// Both exist, no sync record
-				const localHash = await this.hashFile(localFile!);
-				if (localHash === remoteObj!.etag) {
-					// Same content — record state
-					this.syncState.files[path] = {
-						localHash,
-						remoteETag: remoteObj!.etag,
-						lastSynced: Date.now(),
-					};
-				} else if (isInitialSync) {
-					// Different content on initial sync → conflict
-					const resolution = await this.resolveConflict(path, localFile!, remoteObj!);
-					await this.applyResolution(path, localFile!, remoteObj!, resolution);
-				} else {
-					// New on both sides outside initial sync — upload local (local wins)
-					await this.uploadFile(path, localFile!);
-				}
+			case "delete-remote":
+				await this.deleteRemoteObject(path, remoteObj);
+				delete this.syncState.files[path];
+				return;
+			case "trash-local":
+				await this.vault.trash(localFile!, false);
+				delete this.syncState.files[path];
+				return;
+			case "record":
+				this.syncState.files[path] = {
+					localHash: localHash!,
+					remoteETag: remoteObj!.etag,
+					lastSynced: Date.now(),
+				};
+				return;
+			case "conflict": {
+				const resolution = await this.resolveConflict(path, localFile!, remoteObj!);
+				await this.applyResolution(path, localFile!, remoteObj!, resolution);
 				return;
 			}
+			case "none":
+				return;
 		}
-
-		// Has sync record — determine what changed
-		const localHash = localExists ? await this.hashFile(localFile!) : null;
-		const localChanged = localExists
-			? localHash !== syncRecord!.localHash
-			: false;
-		const remoteChanged = remoteExists
-			? remoteObj!.etag !== syncRecord!.remoteETag
-			: false;
-
-		if (wasDeleted && !remoteChanged) {
-			// Local deleted, remote unchanged → delete remote
-			await this.client.deleteObject(path);
-			delete this.syncState.files[path];
-			return;
-		}
-
-		if (wasDeleted && remoteChanged) {
-			// Local deleted but remote changed → conflict
-			// Re-download remote version (remote wins for deleted+changed)
-			await this.downloadFile(path, remoteObj!);
-			return;
-		}
-
-		if (!localExists && !remoteExists) {
-			delete this.syncState.files[path];
-			return;
-		}
-
-		if (localExists && !remoteExists) {
-			if (localChanged || wasChanged) {
-				// Local changed, remote deleted → upload (local wins)
-				await this.uploadFile(path, localFile!);
-			} else {
-				// Local unchanged, remote deleted → delete local
-				await this.vault.delete(localFile!);
-				delete this.syncState.files[path];
-			}
-			return;
-		}
-
-		if (!localExists && remoteExists) {
-			// Shouldn't reach here if wasDeleted was handled above
-			await this.downloadFile(path, remoteObj!);
-			return;
-		}
-
-		// Both exist with sync record
-		if (localChanged && !remoteChanged) {
-			await this.uploadFile(path, localFile!);
-		} else if (!localChanged && remoteChanged) {
-			await this.downloadFile(path, remoteObj!);
-		} else if (localChanged && remoteChanged) {
-			const resolution = await this.resolveConflict(path, localFile!, remoteObj!);
-			await this.applyResolution(path, localFile!, remoteObj!, resolution);
-		}
-		// else: neither changed — no action needed
 	}
 
-	private async uploadFile(path: string, file: TFile): Promise<void> {
+	private async uploadFile(
+		path: string,
+		file: TFile,
+		remoteObj: R2Object | null
+	): Promise<void> {
 		if (!this.client) return;
 		const content = await this.vault.readBinary(file);
-		const localHash = computeMd5Hex(content);
-		const etag = await this.client.uploadObject(path, content);
+		const localHash = computeContentHash(content);
+		const etag = await this.client.uploadObject(
+			path,
+			content,
+			remoteObj ? remoteObj.etag : null
+		);
 		this.syncState.files[path] = {
 			localHash,
 			remoteETag: etag || localHash,
 			lastSynced: Date.now(),
 		};
+	}
+
+	private async deleteRemoteObject(
+		path: string,
+		remoteObj: R2Object | null
+	): Promise<void> {
+		if (!this.client) return;
+		await this.client.deleteObject(path, remoteObj ? remoteObj.etag : null);
 	}
 
 	private async downloadFile(path: string, remoteObj: R2Object): Promise<void> {
@@ -406,7 +405,7 @@ export class SyncEngine {
 			await this.vault.createBinary(path, content);
 		}
 
-		const localHash = computeMd5Hex(content);
+		const localHash = computeContentHash(content);
 		this.syncState.files[path] = {
 			localHash,
 			remoteETag: remoteObj.etag,
@@ -437,8 +436,10 @@ export class SyncEngine {
 		if (!this.client) return;
 
 		switch (resolution) {
+			case "cancel":
+				return;
 			case "keep-local":
-				await this.uploadFile(path, localFile);
+				await this.uploadFile(path, localFile, remoteObj);
 				break;
 			case "keep-remote":
 				await this.downloadFile(path, remoteObj);
@@ -455,12 +456,12 @@ export class SyncEngine {
 				await this.vault.createBinary(conflictPath, remoteContent);
 
 				// Upload local version
-				await this.uploadFile(path, localFile);
+				await this.uploadFile(path, localFile, remoteObj);
 
 				// Upload conflict copy to remote too
 				const conflictFile = this.vault.getAbstractFileByPath(conflictPath);
 				if (conflictFile instanceof TFile) {
-					await this.uploadFile(conflictPath, conflictFile);
+					await this.uploadFile(conflictPath, conflictFile, null);
 				}
 				break;
 			}
@@ -469,7 +470,7 @@ export class SyncEngine {
 
 	private async hashFile(file: TFile): Promise<string> {
 		const content = await this.vault.readBinary(file);
-		return computeMd5Hex(content);
+		return computeContentHash(content);
 	}
 
 	private getLocalFiles(): Map<string, TFile> {
@@ -498,7 +499,7 @@ export class SyncEngine {
 	}
 }
 
-function computeMd5Hex(buffer: ArrayBuffer): string {
+function computeContentHash(buffer: ArrayBuffer): string {
 	// Simple hash for comparing file content
 	// Using a FNV-1a-like hash since we don't have crypto in all environments
 	// R2 ETags are MD5, but for local comparison a consistent hash works
