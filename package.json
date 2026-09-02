@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-remote-sync",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"type": "module",
 	"description": "Sync your Obsidian vault with Cloudflare R2 and Git",
 	"main": "main.js",

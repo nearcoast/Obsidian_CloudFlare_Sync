@@ -5,7 +5,7 @@ import {
 	RemoteSyncSettingTab,
 } from "./settings";
 import { SyncEngine, type SyncStatus } from "./r2/sync-engine";
-import { GitSync } from "./git/git-sync";
+import type { GitSync } from "./git/git-sync";
 import {
 	migrateLegacyR2Credentials,
 	resolveR2Credentials,
@@ -146,6 +146,8 @@ export default class RemoteSyncPlugin extends Plugin {
 	}
 
 	private async initGitSync(): Promise<void> {
+		if (!Platform.isDesktop) return;
+		const { GitSync } = await import("./git/git-sync");
 		this.gitSync = new GitSync(this);
 		try {
 			await this.gitSync.init();
